@@ -224,6 +224,12 @@ def allocate_shared_tensor(shape: Iterable[int], *, dtype: torch.dtype) -> torch
     return tensor
 
 
+def float_tensor_from_storage(storage: torch.FloatStorage) -> FloatTensorType:
+    """Return a 1D float tensor viewing the whole storage, on the storage's device"""
+    tensor = torch.empty((0,), dtype=torch.float, device=storage.device)
+    return tensor.set_(storage)
+
+
 def split_almost_equally(size: int, *, num_parts: int) -> Iterable[slice]:
     """Split an interval of the given size into the given number of subintervals
 
@@ -250,7 +256,7 @@ def fast_approx_rand(out: FloatTensorType) -> None:
     if numel < 1_000_003:
         torch.randn(numel, out=out)
         return
-    t = torch.randn(1_000_003)
+    t = torch.randn(1_000_003, device=out.device)
     excess = numel % 1_000_003
     # Using just `-excess` would give bad results when excess == 0.
     out[: numel - excess].view(-1, 1_000_003)[...] = t

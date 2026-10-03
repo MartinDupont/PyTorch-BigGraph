@@ -8,6 +8,7 @@
 
 import logging
 import math
+import multiprocessing.pool
 import time
 from collections import defaultdict
 from functools import partial
@@ -35,7 +36,11 @@ from torchbiggraph.config import ConfigSchema
 from torchbiggraph.distributed import init_process_group, ProcessRanks, start_server
 from torchbiggraph.edgelist import EdgeList
 from torchbiggraph.eval import RankingEvaluator
-from torchbiggraph.graph_storages import EDGE_STORAGES, ENTITY_STORAGES
+from torchbiggraph.graph_storages import (
+    AbstractEdgeStorage,
+    EDGE_STORAGES,
+    ENTITY_STORAGES,
+)
 from torchbiggraph.losses import AbstractLossFunction, LOSS_FUNCTIONS
 from torchbiggraph.model import make_model, MultiRelationEmbedder
 from torchbiggraph.parameter_sharing import ParameterServer, ParameterSharer
@@ -58,6 +63,7 @@ from torchbiggraph.util import (
     DummyOptimizer,
     EmbeddingHolder,
     fast_approx_rand,
+    float_tensor_from_storage,
     get_async_result,
     get_num_workers,
     hide_distributed_logging,
@@ -270,39 +276,9 @@ class TrainingCoordinator:
             f"types {holder.lhs_partitioned_types} {holder.rhs_partitioned_types}"
         )
 
-        # We know ahead of time that we wil need 1-2 storages for each embedding type,
-        # as well as the max size of this storage (num_entities x D).
-        # We allocate these storages n advance in `embedding_storage_freelist`.
-        # When we need storage for an entity type, we pop it from this free list,
-        # and then add it back when we 'delete' the embedding table.
-        embedding_storage_freelist: Dict[EntityName, Set[torch.FloatStorage]] = (
-            defaultdict(set)
+        embedding_storage_freelist = self._make_embedding_storage_freelist(
+            entity_counts, holder
         )
-        for entity_type, counts in entity_counts.items():
-            max_count = max(counts)
-            if holder.nparts_lhs == 1 and holder.nparts_rhs == 1:
-                num_sides = 1
-            else:
-                num_sides = (
-                    (1 if entity_type in holder.lhs_partitioned_types else 0)
-                    + (1 if entity_type in holder.rhs_partitioned_types else 0)
-                    + (
-                        1
-                        if entity_type
-                        in (
-                            holder.lhs_unpartitioned_types
-                            | holder.rhs_unpartitioned_types
-                        )
-                        else 0
-                    )
-                )
-            for _ in range(num_sides):
-                embedding_storage_freelist[entity_type].add(
-                    allocate_shared_tensor(
-                        (max_count, config.entity_dimension(entity_type)),
-                        dtype=torch.float,
-                    ).storage()
-                )
 
         # create the handlers, threads, etc. for distributed training
         if config.num_machines > 1 or config.num_partition_servers > 0:
@@ -427,13 +403,8 @@ class TrainingCoordinator:
             hide_distributed_logging()
 
         # fork early for HOGWILD threads
-        logger.info("Creating workers...")
         self.num_workers = get_num_workers(config.workers)
-        self.pool = create_pool(
-            self.num_workers,
-            subprocess_name=f"TWorker-{rank}",
-            subprocess_init=subprocess_init,
-        )
+        self.pool = self._create_worker_pool(rank, subprocess_init)
 
         checkpoint_manager = CheckpointManager(
             config.checkpoint_path,
@@ -502,7 +473,7 @@ class TrainingCoordinator:
             count = entity_counts[entity][0]
             s = embedding_storage_freelist[entity].pop()
             dimension = config.entity_dimension(entity)
-            embs = torch.FloatTensor(s).view(-1, dimension)[:count]
+            embs = float_tensor_from_storage(s).view(-1, dimension)[:count]
             embs, optimizer = self._load_embeddings(entity, UNPARTITIONED, out=embs)
             holder.unpartitioned_embeddings[entity] = embs
             trainer.unpartitioned_optimizers[entity] = optimizer
@@ -626,12 +597,11 @@ class TrainingCoordinator:
                 )
 
                 bucket_logger.debug("Loading edges")
-                edges = edge_storage.load_chunk_of_edges(
-                    cur_b.lhs,
-                    cur_b.rhs,
+                edges = self._load_edges(
+                    edge_storage,
+                    cur_b,
                     edge_chunk_idx,
                     iteration_manager.num_edge_chunks,
-                    shared=True,
                 )
                 num_edges = len(edges)
 
@@ -703,6 +673,9 @@ class TrainingCoordinator:
                 )
 
                 self.model.clear_all_embeddings()
+                # Free this bucket's edges before the next bucket loads its own,
+                # so that two buckets' worth of edges are never alive at once.
+                del edges
 
                 cur_stats = BucketStats(
                     lhs_partition=cur_b.lhs,
@@ -731,8 +704,9 @@ class TrainingCoordinator:
 
     def close(self):
         # cleanup
-        self.pool.close()
-        self.pool.join()
+        if self.pool is not None:
+            self.pool.close()
+            self.pool.join()
 
         self._barrier()
 
@@ -751,6 +725,65 @@ class TrainingCoordinator:
     def _barrier(self) -> None:
         if self.barrier_group is not None:
             td.barrier(group=self.barrier_group)
+
+    def _make_embedding_storage_freelist(
+        self, entity_counts: Dict[str, List[int]], holder: EmbeddingHolder
+    ) -> Dict[EntityName, Set[torch.FloatStorage]]:
+        # We know ahead of time that we wil need 1-2 storages for each embedding type,
+        # as well as the max size of this storage (num_entities x D).
+        # We allocate these storages n advance in `embedding_storage_freelist`.
+        # When we need storage for an entity type, we pop it from this free list,
+        # and then add it back when we 'delete' the embedding table.
+        embedding_storage_freelist: Dict[EntityName, Set[torch.FloatStorage]] = (
+            defaultdict(set)
+        )
+        for entity_type, counts in entity_counts.items():
+            max_count = max(counts)
+            if holder.nparts_lhs == 1 and holder.nparts_rhs == 1:
+                num_sides = 1
+            else:
+                num_sides = (
+                    (1 if entity_type in holder.lhs_partitioned_types else 0)
+                    + (1 if entity_type in holder.rhs_partitioned_types else 0)
+                    + (
+                        1
+                        if entity_type
+                        in (
+                            holder.lhs_unpartitioned_types
+                            | holder.rhs_unpartitioned_types
+                        )
+                        else 0
+                    )
+                )
+            for _ in range(num_sides):
+                embedding_storage_freelist[entity_type].add(
+                    allocate_shared_tensor(
+                        (max_count, self.config.entity_dimension(entity_type)),
+                        dtype=torch.float,
+                    ).storage()
+                )
+        return embedding_storage_freelist
+
+    def _create_worker_pool(
+        self, rank: Rank, subprocess_init: Optional[Callable[[], None]]
+    ) -> Optional[multiprocessing.pool.Pool]:
+        logger.info("Creating workers...")
+        return create_pool(
+            self.num_workers,
+            subprocess_name=f"TWorker-{rank}",
+            subprocess_init=subprocess_init,
+        )
+
+    def _load_edges(
+        self,
+        edge_storage: AbstractEdgeStorage,
+        bucket: Bucket,
+        edge_chunk_idx: int,
+        num_edge_chunks: int,
+    ) -> EdgeList:
+        return edge_storage.load_chunk_of_edges(
+            bucket.lhs, bucket.rhs, edge_chunk_idx, num_edge_chunks, shared=True
+        )
 
     def _load_embeddings(
         self,
@@ -834,7 +867,7 @@ class TrainingCoordinator:
                 count = self.entity_counts[entity][part]
                 s = self.embedding_storage_freelist[entity].pop()
                 dimension = self.config.entity_dimension(entity)
-                embs = torch.FloatTensor(s).view(-1, dimension)[:count]
+                embs = float_tensor_from_storage(s).view(-1, dimension)[:count]
                 embs, optimizer = self._load_embeddings(
                     entity, part, out=embs, strict=self.strict, force_dirty=force_dirty
                 )

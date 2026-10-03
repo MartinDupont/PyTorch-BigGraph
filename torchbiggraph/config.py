@@ -496,6 +496,16 @@ class ConfigSchema(Schema):
     half_precision: bool = attr.ib(
         default=False, metadata={"help": "Use half-precision training (GPU ONLY)"}
     )
+    unified_memory: bool = attr.ib(
+        default=False,
+        metadata={
+            "help": "Train on a single GPU whose memory is shared with the CPU "
+            "(e.g., NVIDIA DGX Spark). Embeddings, optimizer state and edges "
+            "are kept only as CUDA tensors, instead of a CPU copy plus a GPU "
+            "copy. Requires num_gpus to be 0 or 1, a single machine, and all "
+            "entity types to have the same number of partitions."
+        },
+    )
 
     # Additional global validation.
 

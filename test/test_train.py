@@ -6,10 +6,17 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE.txt file in the root directory of this source tree.
 
+import logging
 from itertools import product
+from types import SimpleNamespace
 from unittest import main, TestCase
 
+import torch
+from torchbiggraph.edgelist import EdgeList
+from torchbiggraph.entitylist import EntityList
+from torchbiggraph.stats import Stats
 from torchbiggraph.train_cpu import IterationManager
+from torchbiggraph.train_unified import UnifiedTrainingCoordinator
 
 
 class TestIterationManager(TestCase):
@@ -67,6 +74,66 @@ class TestIterationManager(TestCase):
                 "iteration/edge_chunk_idx": 2,
             },
         )
+
+
+class TestUnifiedCoordinateTrain(TestCase):
+    def _run(self, num_dynamic_rels: int) -> None:
+        num_edges, num_rels = 1000, 3
+        lhs = torch.arange(num_edges)
+        rhs = torch.arange(num_edges) + num_edges
+        rel = torch.randint(num_rels, (num_edges,))
+        edges = EdgeList(
+            EntityList.from_tensor(lhs.clone()),
+            EntityList.from_tensor(rhs.clone()),
+            rel.clone(),
+        )
+        eval_edge_idxs = torch.randint(num_edges, (50,))
+
+        batches = []
+
+        class RecordingTrainer:
+            def process_one_batch(self, model, batch):
+                # Batches are views of the edge tensors, which are modified
+                # again after training, so take a snapshot.
+                batches.append(
+                    EdgeList(
+                        EntityList.from_tensor(batch.lhs.tensor.clone()),
+                        EntityList.from_tensor(batch.rhs.tensor.clone()),
+                        batch.rel.clone(),
+                    )
+                )
+                return Stats(count=len(batch))
+
+        coordinator = UnifiedTrainingCoordinator.__new__(UnifiedTrainingCoordinator)
+        coordinator.device = torch.device("cpu")
+        coordinator.bucket_logger = logging.getLogger("test")
+        coordinator.model = SimpleNamespace(num_dynamic_rels=num_dynamic_rels)
+        coordinator.trainer = RecordingTrainer()
+        coordinator.config = SimpleNamespace(batch_size=64)
+        coordinator._coordinate_train(edges, eval_edge_idxs, epoch_idx=0)
+
+        # Every training edge is seen exactly once, and no eval edge is.
+        trained = torch.cat([b.lhs.tensor for b in batches])
+        eval_set = set(eval_edge_idxs.tolist())
+        expected = sorted(set(range(num_edges)) - eval_set)
+        self.assertEqual(sorted(trained.tolist()), expected)
+        for b in batches:
+            # Edges kept their own rhs and relation type through the reordering.
+            self.assertTrue(torch.equal(b.rhs.tensor, b.lhs.tensor + num_edges))
+            self.assertTrue(torch.equal(b.rel.expand(len(b)), rel[b.lhs.tensor]))
+            if num_dynamic_rels == 0:
+                self.assertTrue(b.has_scalar_relation_type())
+        # Eval edges are back at their original positions for evaluation.
+        self.assertTrue(torch.equal(edges.lhs.tensor[eval_edge_idxs], eval_edge_idxs))
+        self.assertTrue(
+            torch.equal(edges.rel[eval_edge_idxs], rel[eval_edge_idxs])
+        )
+
+    def test_grouped_by_relation_type(self) -> None:
+        self._run(num_dynamic_rels=0)
+
+    def test_dynamic_relations(self) -> None:
+        self._run(num_dynamic_rels=3)
 
 
 if __name__ == "__main__":

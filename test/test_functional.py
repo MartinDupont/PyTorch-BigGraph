@@ -28,6 +28,7 @@ from torchbiggraph.partitionserver import run_partition_server
 from torchbiggraph.stats import SerializedStats
 from torchbiggraph.train import train
 from torchbiggraph.train_gpu import CPP_INSTALLED
+from torchbiggraph.train_unified import UnifiedTrainingCoordinator
 from torchbiggraph.util import (
     call_one_after_the_other,
     setup_logging,
@@ -540,6 +541,103 @@ class TestFunctional(TestCase):
         # Just make sure no exceptions are raised and nothing crashes.
         train(train_config, rank=0, subprocess_init=self.subprocess_init)
         self.assertCheckpointWritten(train_config, version=1)
+        do_eval(eval_config, subprocess_init=self.subprocess_init)
+
+    def test_unified_cpu(self) -> None:
+        # Runs the unified-memory coordinator on the CPU, to exercise its logic
+        # on machines without a GPU.
+        self._test_unified(device=torch.device("cpu"))
+
+    def test_unified_cpu_partitioned(self) -> None:
+        self._test_unified(device=torch.device("cpu"), num_partitions=2)
+
+    def test_unified_cpu_bipartite(self) -> None:
+        self._test_unified(device=torch.device("cpu"), bipartite=True)
+
+    def test_unified_cpu_resume_from_checkpoint(self) -> None:
+        self._test_unified(device=torch.device("cpu"), resume=True)
+
+    @unittest.skipIf(not torch.cuda.is_available(), "No GPU")
+    def test_unified_gpu(self) -> None:
+        self._test_unified()
+
+    @unittest.skipIf(not torch.cuda.is_available(), "No GPU")
+    def test_unified_gpu_partitioned(self) -> None:
+        self._test_unified(num_partitions=2)
+
+    @unittest.skipIf(not torch.cuda.is_available(), "No GPU")
+    def test_unified_gpu_bipartite(self) -> None:
+        self._test_unified(bipartite=True)
+
+    @unittest.skipIf(not torch.cuda.is_available(), "No GPU")
+    def test_unified_gpu_half(self) -> None:
+        self._test_unified(num_partitions=2, do_half_precision=True)
+
+    def _test_unified(
+        self,
+        device=None,
+        num_partitions=1,
+        bipartite=False,
+        resume=False,
+        do_half_precision=False,
+    ):
+        if bipartite:
+            entities = {
+                "e1": EntitySchema(num_partitions=2),
+                "e2": EntitySchema(num_partitions=2),
+            }
+            relation_configs = [
+                RelationSchema(name="r1", lhs="e1", rhs="e2"),
+                RelationSchema(name="r2", lhs="e1", rhs="e2", operator="translation"),
+            ]
+        else:
+            entities = {"e": EntitySchema(num_partitions=num_partitions)}
+            relation_configs = [
+                RelationSchema(name="r", lhs="e", rhs="e", operator="complex_diagonal")
+            ]
+        base_config = ConfigSchema(
+            dimension=16,
+            batch_size=1024,
+            num_batch_negs=64,
+            num_uniform_negs=64,
+            relations=relation_configs,
+            entities=entities,
+            entity_path=None,  # filled in later
+            edge_paths=[],  # filled in later
+            checkpoint_path=self.checkpoint_path.name,
+            num_epochs=2,
+            unified_memory=True,
+            regularization_coef=1e-4,
+            half_precision=do_half_precision,
+        )
+        dataset = generate_dataset(base_config, num_entities=100, fractions=[0.4, 0.2])
+        self.addCleanup(dataset.cleanup)
+        train_config = attr.evolve(
+            base_config,
+            entity_path=dataset.entity_path.name,
+            edge_paths=[dataset.relation_paths[0].name],
+        )
+        eval_config = attr.evolve(
+            base_config,
+            entity_path=dataset.entity_path.name,
+            edge_paths=[dataset.relation_paths[1].name],
+            relations=[attr.evolve(r, all_negs=True) for r in relation_configs],
+        )
+
+        def run(config):
+            coordinator = UnifiedTrainingCoordinator(
+                config, subprocess_init=self.subprocess_init, device=device
+            )
+            self.assertIsNone(coordinator.pool)
+            coordinator.train()
+            coordinator.close()
+
+        run(train_config)
+        self.assertCheckpointWritten(train_config, version=2)
+        if resume:
+            resumed_config = attr.evolve(train_config, num_epochs=4)
+            run(resumed_config)
+            self.assertCheckpointWritten(resumed_config, version=4)
         do_eval(eval_config, subprocess_init=self.subprocess_init)
 
     def _test_distributed(self, num_partitions):

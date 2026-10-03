@@ -14,6 +14,32 @@ that is already directed, it may be beneficial to artificially add a "reversed"
 edge ``b ~> a`` for each original edge ``a -> b``, of a different relation type.
 This is automatically done by PBG in the :ref:`dynamic relations mode <dynamic-relations>`.
 
+Training on a GPU with unified memory
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+The regular GPU trainer (``num_gpus``) is designed for GPUs with their own
+memory: it keeps the embeddings of the active partitions in CPU shared memory
+and copies them to the GPU for training, and it also keeps two CPU copies of
+the current chunk of edges plus one on the GPU. On machines where the CPU and
+GPU share the same physical memory, such as an NVIDIA DGX Spark, all these
+copies take up the same RAM.
+
+Setting ``unified_memory=True`` trains on a single GPU while keeping a single
+copy of everything as CUDA tensors. Roughly, for each bucket this needs:
+
+- ``4 * D`` bytes per entity of the active partitions for the embeddings, plus
+  4 bytes for the optimizer state. The buffers for the largest partitions are
+  allocated at startup, so running out of memory happens immediately.
+- 24 bytes per edge of the current edge chunk, plus up to 24 bytes per edge
+  while the chunk is being shuffled. The size of a chunk is controlled by
+  ``num_edge_chunks`` or ``max_edges_per_chunk``.
+
+All entity types must have the same number of partitions, and featurized
+entities, edge weights and distributed training aren't supported in this mode.
+No worker processes are created, so ``workers`` has no effect. It may help to
+set ``PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True``, so that edge chunks of
+different sizes don't fragment GPU memory.
+
 Common issues
 -------------
 

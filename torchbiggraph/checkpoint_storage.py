@@ -153,8 +153,27 @@ MODEL_STATE_DICT_GROUP = "model"
 OPTIMIZER_STATE_DICT_DATASET = "optimizer/state_dict"
 
 
+# Embeddings that live on a GPU are moved to/from disk through a CPU staging
+# buffer of at most this many bytes, rather than through a full-size CPU copy.
+STAGING_BUFFER_BYTES = 256 * 1024 * 1024
+
+
+def _rows_per_stage(tensor: torch.Tensor) -> int:
+    row_bytes = max(1, tensor[:1].numel() * tensor.element_size())
+    return max(1, STAGING_BUFFER_BYTES // row_bytes)
+
+
 def save_embeddings(hf: h5py.File, embeddings: FloatTensorType) -> None:
-    hf.create_dataset(EMBEDDING_DATASET, data=embeddings.numpy())
+    if embeddings.device.type == "cpu":
+        hf.create_dataset(EMBEDDING_DATASET, data=embeddings.numpy())
+        return
+    dataset = hf.create_dataset(
+        EMBEDDING_DATASET, shape=tuple(embeddings.shape), dtype=np.float32
+    )
+    step = _rows_per_stage(embeddings)
+    for begin in range(0, embeddings.shape[0], step):
+        end = min(begin + step, embeddings.shape[0])
+        dataset[begin:end] = embeddings[begin:end].cpu().numpy()
 
 
 def load_embeddings(
@@ -164,8 +183,19 @@ def load_embeddings(
     if out is None:
         out = allocate_shared_tensor(dataset.shape, dtype=torch.float)
     # Needed because https://github.com/h5py/h5py/issues/870.
-    if dataset.size > 0:
+    if dataset.size == 0:
+        return out
+    if out.device.type == "cpu":
         dataset.read_direct(out.numpy())
+        return out
+    step = _rows_per_stage(out)
+    staging = torch.empty((step,) + tuple(out.shape[1:]), dtype=out.dtype)
+    for begin in range(0, out.shape[0], step):
+        end = min(begin + step, out.shape[0])
+        dataset.read_direct(
+            staging.numpy(), source_sel=np.s_[begin:end], dest_sel=np.s_[: end - begin]
+        )
+        out[begin:end].copy_(staging[: end - begin])
     return out
 
 

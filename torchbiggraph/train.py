@@ -15,6 +15,7 @@ from torchbiggraph.config import add_to_sys_path, ConfigFileLoader, ConfigSchema
 from torchbiggraph.model import MultiRelationEmbedder
 from torchbiggraph.train_cpu import TrainingCoordinator
 from torchbiggraph.train_gpu import GPUTrainingCoordinator
+from torchbiggraph.train_unified import UnifiedTrainingCoordinator
 from torchbiggraph.types import Rank, SINGLE_TRAINER
 from torchbiggraph.util import (
     set_logging_verbosity,
@@ -35,9 +36,12 @@ def train(
     rank: Rank = SINGLE_TRAINER,
     subprocess_init: Optional[Callable[[], None]] = None,
 ) -> None:
-    CoordinatorT = (
-        GPUTrainingCoordinator if config.num_gpus > 0 else TrainingCoordinator
-    )
+    if config.unified_memory:
+        CoordinatorT = UnifiedTrainingCoordinator
+    elif config.num_gpus > 0:
+        CoordinatorT = GPUTrainingCoordinator
+    else:
+        CoordinatorT = TrainingCoordinator
     coordinator = CoordinatorT(config, model, trainer, evaluator, rank, subprocess_init)
     coordinator.train()
     coordinator.close()

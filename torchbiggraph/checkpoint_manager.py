@@ -426,9 +426,22 @@ class ConfigMetadataProvider(MetadataProvider):
         return {"config/json": self.json_config_dict}
 
 
+def _to_cpu(obj: Any) -> Any:
+    if isinstance(obj, torch.Tensor):
+        return obj.cpu()
+    if isinstance(obj, dict):
+        return {k: _to_cpu(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return type(obj)(_to_cpu(v) for v in obj)
+    return obj
+
+
 def serialize_optim_state(optim_state: Optional[OptimizerStateDict]) -> Optional[bytes]:
     if optim_state is None:
         return None
+    # Always store CPU tensors, so that checkpoints written by a GPU trainer can
+    # be loaded on a machine without one.
+    optim_state = _to_cpu(optim_state)
     with io.BytesIO() as bf:
         torch.save(optim_state, bf)
         return bf.getvalue()
